@@ -6,6 +6,7 @@ locally after `ninja sta`, and inside the Modal image. Skipped when no sta
 binary is available (e.g. the plain-CPU GitHub CI job).
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -16,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from session_rpc import SessionRpcMixin, TclShellError  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent.parent
-STA = REPO / "build" / "sta"
-DESIGN = REPO / "work" / "design.tcl"
+STA = Path(os.environ.get("STA_BIN", REPO / "build" / "sta"))
+DESIGN = Path(os.environ.get("STA_DESIGN", REPO / "work" / "design.tcl"))
 
 pytestmark = pytest.mark.skipif(
     not STA.exists(), reason="no sta binary (run ninja sta first)")

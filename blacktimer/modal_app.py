@@ -2,8 +2,8 @@
 
 Phase 0 scaffolding: the app topology -- image, volumes, and the function
 families of section 4.1 -- is real and runnable today, with the CPU engine
-(vendored OpenSTA, built inside the image from this repository) standing in
-for the GPU engine everywhere a kernel will eventually run. `golden_diff`
+(vendored OpenSTA, compiled by build() into the build-cache volume) standing
+in for the GPU engine everywhere a kernel will eventually run. `golden_diff`
 therefore executes as the null test from section 9 Phase 0: OpenSTA on both
 sides, proving the harness end to end before any CUDA lands.
 
@@ -62,17 +62,15 @@ image = (
     )
     .pip_install("pytest")
     # Vendored OpenSTA source == this repository (DESIGN.md section 2.3:
-    # reuse OpenSTA's readers rather than rewriting parsers).
+    # reuse OpenSTA's readers rather than rewriting parsers). Deliberately
+    # NOT compiled here: a compile layer makes the image build a ~30-minute
+    # streamed operation that flaky client connections abort. build() below
+    # compiles into the build-cache volume with ccache instead.
     .add_local_dir(
         str(REPO_ROOT),
         "/opt/blacktimer/OpenSTA",
         copy=True,
         ignore=[".git", "build", "**/__pycache__"],
-    )
-    .run_commands(
-        "cd /opt/blacktimer/OpenSTA && mkdir -p build && cd build"
-        " && cmake -G Ninja -DCUDD_DIR=/cudd-3.0.0 .."
-        " && ninja",
     )
     # session_rpc is imported by this definition file at load time, so it
     # must ship alongside it in the container (the copy inside the vendored
@@ -80,14 +78,17 @@ image = (
     .add_local_python_source("session_rpc")
 )
 
-STA = "/opt/blacktimer/OpenSTA/build/sta"
-BT = "/opt/blacktimer/OpenSTA/blacktimer"
+SRC = "/opt/blacktimer/OpenSTA"
+BT = f"{SRC}/blacktimer"
 
 designs_vol = modal.Volume.from_name("blacktimer-designs", create_if_missing=True)
 cache_vol = modal.Volume.from_name("blacktimer-build-cache", create_if_missing=True)
 
 DESIGNS = "/designs"
 CACHE = "/cache"
+# The sta binary lives on the build-cache volume (compiled by build(),
+# reused by every other function; survives image rebuilds via ccache).
+STA = f"{CACHE}/build/sta"
 
 # ---------------------------------------------------------------------------
 # Engine dispatch. Phase 0 has exactly one engine (OpenSTA on CPU); the GPU
@@ -133,34 +134,46 @@ def _run_engine(engine: str, design: dict, out_csv: str) -> None:
     )
 
 
-@app.function(image=image, volumes={CACHE: cache_vol}, timeout=3600)
+@app.function(image=image, volumes={CACHE: cache_vol}, cpu=16, timeout=3600)
 def build() -> str:
-    """[CPU] Rebuild the engine with the shared ccache (DESIGN.md s4.1).
-
-    The image already contains a full build; this function exists for
-    incremental rebuilds against the build-cache volume once the CUDA engine
-    (Phase 1) makes cold nvcc runs expensive.
-    """
-    env = dict(os.environ, CCACHE_DIR=f"{CACHE}/ccache")
+    """[CPU] Compile the engine into the build-cache volume (DESIGN.md
+    s4.1). ccache lives on the same volume, so rebuilds after source-only
+    image refreshes are incremental; the resulting sta binary at
+    {CACHE}/build/sta is shared by every other function."""
+    env = dict(
+        os.environ,
+        CCACHE_DIR=f"{CACHE}/ccache",
+        CMAKE_CXX_COMPILER_LAUNCHER="ccache",
+        CMAKE_C_COMPILER_LAUNCHER="ccache",
+    )
+    build_dir = f"{CACHE}/build"
     subprocess.run(
-        ["cmake", "--build", "/opt/blacktimer/OpenSTA/build"],
+        ["cmake", "-G", "Ninja", "-B", build_dir, "-S", SRC,
+         "-DCUDD_DIR=/cudd-3.0.0",
+         "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+         "-DCMAKE_C_COMPILER_LAUNCHER=ccache"],
         env=env, check=True,
     )
+    subprocess.run(["ninja", "-C", build_dir, "sta"], env=env, check=True)
     cache_vol.commit()
-    return "build ok"
+    return "build ok: " + subprocess.run(
+        [STA, "-version"], capture_output=True, text=True).stdout.strip()
 
 
-@app.function(image=image, gpu="B200", timeout=1800)
+@app.function(image=image, gpu="B200", volumes={CACHE: cache_vol},
+              timeout=1800)
 def unit_tests() -> str:
     """[B200] Kernel-level tests. Phase 0: harness tests + GPU smoke check."""
     subprocess.run(["nvidia-smi"], check=True)
+    env = dict(os.environ, STA_BIN=STA, STA_DESIGN=f"{SRC}/work/design.tcl")
     subprocess.run(
-        ["python", "-m", "pytest", f"{BT}/tests", "-q"], check=True
+        ["python", "-m", "pytest", f"{BT}/tests", "-q"], env=env, check=True
     )
     return "unit tests ok"
 
 
-@app.function(image=image, gpu="B200", volumes={DESIGNS: designs_vol}, timeout=3600)
+@app.function(image=image, gpu="B200",
+              volumes={DESIGNS: designs_vol, CACHE: cache_vol}, timeout=3600)
 def full_sta(design_name: str, corner: str = "default") -> str:
     """[B200] One end-to-end timing run; returns the endpoint-slack CSV."""
     design = _load_design(design_name)
@@ -181,7 +194,8 @@ def mmmc_sweep(design_name: str, corners: list[str]) -> dict[str, str]:
     return dict(zip(corners, results))
 
 
-@app.function(image=image, volumes={DESIGNS: designs_vol}, memory=32768, timeout=7200)
+@app.function(image=image, volumes={DESIGNS: designs_vol, CACHE: cache_vol},
+              memory=32768, timeout=7200)
 def golden_diff(design_name: str) -> str:
     """[CPU, high-mem] Reference OpenSTA vs DUT engine, 1 ps endpoint gate.
 
@@ -209,7 +223,8 @@ def golden_diff(design_name: str) -> str:
     return result.summary()
 
 
-@app.function(image=image, gpu="B200", volumes={DESIGNS: designs_vol}, timeout=3600)
+@app.function(image=image, gpu="B200",
+              volumes={DESIGNS: designs_vol, CACHE: cache_vol}, timeout=3600)
 def bench(design_name: str, corner: str = "default") -> dict:
     """[B200] Perf harness following the GPUTimer TCAD'23 protocol
     (EVALUATION.md E1): one full-timing iteration measured end-to-end,
@@ -259,7 +274,8 @@ def _write_design_tcl(design: dict) -> str:
     return path
 
 
-@app.cls(image=image, gpu="B200", volumes={DESIGNS: designs_vol},
+@app.cls(image=image, gpu="B200",
+         volumes={DESIGNS: designs_vol, CACHE: cache_vol},
          scaledown_window=600)
 class TimerSession(SessionRpcMixin):
     """[B200] Long-lived incremental server (DESIGN.md s4.1, s7).
