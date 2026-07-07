@@ -1,0 +1,51 @@
+# BlackTimer Phase 0 CI (blacktimer/DESIGN.md section 9).
+#
+# Two tiers:
+#   harness      - pure-Python golden-diff harness tests; runs on every push
+#                  touching blacktimer/, no secrets needed.
+#   modal-gate   - the real per-merge gate (build + unit tests + golden
+#                  null-diff on a B200) via Modal; runs only when the
+#                  MODAL_TOKEN_ID/MODAL_TOKEN_SECRET secrets are configured.
+
+name: blacktimer
+
+on:
+  push:
+    paths:
+      - "blacktimer/**"
+      - ".github/workflows/blacktimer.yml"
+  pull_request:
+    paths:
+      - "blacktimer/**"
+      - ".github/workflows/blacktimer.yml"
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest
+      - run: python -m pytest blacktimer/tests -q
+
+  modal-gate:
+    runs-on: ubuntu-latest
+    needs: harness
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run Modal CI gate
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ]; then
+            echo "MODAL_TOKEN_ID secret not configured; skipping GPU gate."
+            exit 0
+          fi
+          pip install modal
+          modal run blacktimer/modal_app.py::ci
