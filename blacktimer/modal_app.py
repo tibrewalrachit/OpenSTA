@@ -14,15 +14,25 @@ Usage (requires a Modal account and `pip install modal`):
     modal run blacktimer/modal_app.py::diff --design gcd_sky130hd
 """
 
-from __future__ import annotations
+# NOTE: no `from __future__ import annotations` here -- Modal's class
+# parameter encoder resolves annotations at runtime and PEP 563 string
+# annotations break modal.parameter().
 
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import modal
+
+for _p in (Path(__file__).resolve().parent,
+           Path("/opt/blacktimer/OpenSTA/blacktimer")):
+    if (_p / "session_rpc.py").exists():
+        sys.path.insert(0, str(_p))
+        break
+from session_rpc import SessionRpcMixin  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -64,6 +74,10 @@ image = (
         " && cmake -G Ninja -DCUDD_DIR=/cudd-3.0.0 .."
         " && ninja",
     )
+    # session_rpc is imported by this definition file at load time, so it
+    # must ship alongside it in the container (the copy inside the vendored
+    # tree above is for the pytest run, not for this module's import).
+    .add_local_python_source("session_rpc")
 )
 
 STA = "/opt/blacktimer/OpenSTA/build/sta"
@@ -119,7 +133,7 @@ def _run_engine(engine: str, design: dict, out_csv: str) -> None:
     )
 
 
-@app.function(image=image, volumes={CACHE: CACHE}, timeout=3600)
+@app.function(image=image, volumes={CACHE: cache_vol}, timeout=3600)
 def build() -> str:
     """[CPU] Rebuild the engine with the shared ccache (DESIGN.md s4.1).
 
@@ -146,7 +160,7 @@ def unit_tests() -> str:
     return "unit tests ok"
 
 
-@app.function(image=image, gpu="B200", volumes={DESIGNS: DESIGNS}, timeout=3600)
+@app.function(image=image, gpu="B200", volumes={DESIGNS: designs_vol}, timeout=3600)
 def full_sta(design_name: str, corner: str = "default") -> str:
     """[B200] One end-to-end timing run; returns the endpoint-slack CSV."""
     design = _load_design(design_name)
@@ -155,7 +169,7 @@ def full_sta(design_name: str, corner: str = "default") -> str:
     return Path(out).read_text()
 
 
-@app.function(image=image, volumes={DESIGNS: DESIGNS}, timeout=3600)
+@app.function(image=image, volumes={DESIGNS: designs_vol}, timeout=3600)
 def mmmc_sweep(design_name: str, corners: list[str]) -> dict[str, str]:
     """[fan-out coordinator] Map corner batches over B200 containers.
 
@@ -167,7 +181,7 @@ def mmmc_sweep(design_name: str, corners: list[str]) -> dict[str, str]:
     return dict(zip(corners, results))
 
 
-@app.function(image=image, volumes={DESIGNS: DESIGNS}, memory=32768, timeout=7200)
+@app.function(image=image, volumes={DESIGNS: designs_vol}, memory=32768, timeout=7200)
 def golden_diff(design_name: str) -> str:
     """[CPU, high-mem] Reference OpenSTA vs DUT engine, 1 ps endpoint gate.
 
@@ -195,7 +209,7 @@ def golden_diff(design_name: str) -> str:
     return result.summary()
 
 
-@app.function(image=image, gpu="B200", volumes={DESIGNS: DESIGNS}, timeout=3600)
+@app.function(image=image, gpu="B200", volumes={DESIGNS: designs_vol}, timeout=3600)
 def bench(design_name: str, corner: str = "default") -> dict:
     """[B200] Perf harness following the GPUTimer TCAD'23 protocol
     (EVALUATION.md E1): one full-timing iteration measured end-to-end,
@@ -230,14 +244,30 @@ def bench(design_name: str, corner: str = "default") -> dict:
     }
 
 
-@app.cls(image=image, gpu="B200", volumes={DESIGNS: DESIGNS},
+def _write_design_tcl(design: dict) -> str:
+    """Emit a load script for a design.json descriptor (TimerSession's
+    equivalent of the env-var plumbing in _run_engine)."""
+    d = Path(design["dir"])
+    lines = [f"read_liberty {{{d / lib}}}" for lib in design["liberty"]]
+    lines.append(f"read_verilog {{{d / design['verilog']}}}")
+    lines.append(f"link_design {{{design['top']}}}")
+    if design.get("spef"):
+        lines.append(f"read_spef {{{d / design['spef']}}}")
+    lines.append(f"read_sdc {{{d / design['sdc']}}}")
+    path = f"/tmp/{design['top']}.load.tcl"
+    Path(path).write_text("\n".join(lines) + "\n")
+    return path
+
+
+@app.cls(image=image, gpu="B200", volumes={DESIGNS: designs_vol},
          scaledown_window=600)
-class TimerSession:
+class TimerSession(SessionRpcMixin):
     """[B200] Long-lived incremental server (DESIGN.md s4.1, s7).
 
-    Phase 0: loads the design and runs full timing once on enter. Phase 4
-    adds the command channel, graph overlay, and incremental K1-K4 behind
-    the same RPC surface.
+    Phase 0: loads the design into a persistent OpenSTA process on enter;
+    the sta-claude RPC surface (session_rpc.SessionRpcMixin) serves queries
+    and ECOs against it. Phase 4 swaps the GPU engine + command channel in
+    behind the same methods.
     """
 
     design_name: str = modal.parameter()
@@ -245,24 +275,61 @@ class TimerSession:
     @modal.enter()
     def load(self) -> None:
         self.design = _load_design(self.design_name)
-        self.baseline_csv = f"/tmp/{self.design_name}.session.csv"
-        _run_engine(DUT_ENGINE, self.design, self.baseline_csv)
+        self.rpc_init(STA, _write_design_tcl(self.design))
+
+    @modal.exit()
+    def unload(self) -> None:
+        self.rpc_close()
+
+    # sta-claude RPC surface (server/backends/blacktimer.py client).
+    # Modal only exposes decorated attributes of the class itself, so the
+    # mixin methods get one-line remote forwarders here.
+
+    @modal.method()
+    def summary(self) -> dict:
+        return SessionRpcMixin.summary(self)
+
+    @modal.method()
+    def worst_paths(self, n: int = 5, path_delay: str = "max") -> list:
+        return SessionRpcMixin.worst_paths(self, n, path_delay)
+
+    @modal.method()
+    def get_path(self, endpoint: str, path_delay: str = "max") -> dict:
+        return SessionRpcMixin.get_path(self, endpoint, path_delay)
+
+    @modal.method()
+    def pin_timing(self, pin: str) -> dict:
+        return SessionRpcMixin.pin_timing(self, pin)
+
+    @modal.method()
+    def endpoint_histogram(self, bins: int = 10,
+                           path_delay: str = "max") -> dict:
+        return SessionRpcMixin.endpoint_histogram(self, bins, path_delay)
+
+    @modal.method()
+    def compare_corners(self) -> dict:
+        return SessionRpcMixin.compare_corners(self)
+
+    @modal.method()
+    def check_exceptions(self) -> dict:
+        return SessionRpcMixin.check_exceptions(self)
+
+    @modal.method()
+    def clock_info(self) -> dict:
+        return SessionRpcMixin.clock_info(self)
+
+    @modal.method()
+    def run_tcl(self, script: str) -> str:
+        return SessionRpcMixin.run_tcl(self, script)
+
+    @modal.method()
+    def apply_eco(self, edits: list) -> dict:
+        return SessionRpcMixin.apply_eco(self, edits)
 
     @modal.method()
     def report_wns(self) -> float:
-        import sys
-
-        sys.path.insert(0, BT)
-        from harness.golden_diff import load_endpoint_csv
-
-        slacks = load_endpoint_csv(self.baseline_csv)
-        return min(s.slack_max for s in slacks.values())
-
-    @modal.method()
-    def update_timing(self, edits: list[dict]) -> str:
-        raise NotImplementedError(
-            "incremental ECO path lands in Phase 4 (DESIGN.md s9)"
-        )
+        """Back-compat convenience: worst setup slack in ns."""
+        return self.summary()["worst_slack_max"]
 
 
 # ---------------------------------------------------------------------------
