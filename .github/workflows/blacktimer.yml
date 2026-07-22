@@ -48,4 +48,7 @@ jobs:
             exit 0
           fi
           pip install modal
+          # seed_designs is idempotent; it makes the gate self-contained on
+          # a fresh Modal workspace (the designs volume starts empty).
+          modal run blacktimer/modal_app.py::seed_designs
           modal run blacktimer/modal_app.py::ci
