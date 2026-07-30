@@ -38,10 +38,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 app = modal.App("blacktimer")
 
+# GPU type for all GPU functions. H100 (sm_90) is the default evaluation
+# target; set BLACKTIMER_GPU=B200 (sm_100) to switch back -- the image and
+# fatbins support both.
+GPU_KIND = os.environ.get("BLACKTIMER_GPU", "H100")
+
 # ---------------------------------------------------------------------------
-# Image: CUDA toolkit + OpenSTA deps + vendored OpenSTA built from this repo.
-# Mirrors Dockerfile.ubuntu22.04 at the repo root, on a CUDA devel base so
-# Phase 1 kernels compile in the same image.
+# Image: CUDA toolkit + OpenSTA build deps + vendored OpenSTA *source*
+# (build() compiles it into the cache volume). CUDA devel base so Phase 1
+# kernels and GCS-Timer compile in the same image.
 # ---------------------------------------------------------------------------
 image = (
     modal.Image.from_registry(
@@ -118,6 +123,10 @@ def _run_engine(engine: str, design: dict, out_csv: str) -> None:
         raise NotImplementedError(
             f"engine {engine!r}: GPU engine lands in Phase 1 (DESIGN.md s9)"
         )
+    if not Path(STA).exists():
+        raise RuntimeError(
+            f"{STA} not found -- run `modal run "
+            "blacktimer/modal_app.py::ci` (or build.remote()) first")
     d = Path(design["dir"])
     env = dict(
         os.environ,
@@ -161,10 +170,10 @@ def build() -> str:
         [STA, "-version"], capture_output=True, text=True).stdout.strip()
 
 
-@app.function(image=image, gpu="B200", volumes={CACHE: cache_vol},
+@app.function(image=image, gpu=GPU_KIND, volumes={CACHE: cache_vol},
               timeout=1800)
 def unit_tests() -> str:
-    """[B200] Kernel-level tests. Phase 0: harness tests + GPU smoke check."""
+    """[GPU] Kernel-level tests. Phase 0: harness tests + GPU smoke check."""
     subprocess.run(["nvidia-smi"], check=True)
     env = dict(os.environ, STA_BIN=STA, STA_DESIGN=f"{SRC}/work/design.tcl")
     subprocess.run(
@@ -173,10 +182,10 @@ def unit_tests() -> str:
     return "unit tests ok"
 
 
-@app.function(image=image, gpu="B200",
+@app.function(image=image, gpu=GPU_KIND,
               volumes={DESIGNS: designs_vol, CACHE: cache_vol}, timeout=3600)
 def full_sta(design_name: str, corner: str = "default") -> str:
-    """[B200] One end-to-end timing run; returns the endpoint-slack CSV."""
+    """[GPU] One end-to-end timing run; returns the endpoint-slack CSV."""
     design = _load_design(design_name)
     out = f"/tmp/{design_name}.{corner}.{DUT_ENGINE}.csv"
     _run_engine(DUT_ENGINE, design, out)
@@ -203,8 +212,6 @@ def golden_diff(design_name: str) -> str:
     Phase 0: DUT is also the CPU engine (null test). Raises on divergence so
     CI fails loudly. Waivers live at /designs/<name>/waivers.json.
     """
-    import sys
-
     sys.path.insert(0, BT)
     from harness import golden_diff as gd
 
@@ -224,15 +231,14 @@ def golden_diff(design_name: str) -> str:
     return result.summary()
 
 
-@app.function(image=image, gpu="B200",
+@app.function(image=image, gpu=GPU_KIND,
               volumes={DESIGNS: designs_vol, CACHE: cache_vol}, timeout=3600)
 def bench(design_name: str, corner: str = "default") -> dict:
-    """[B200] Perf harness following the GPUTimer TCAD'23 protocol
+    """[GPU] Perf harness following the GPUTimer TCAD'23 protocol
     (EVALUATION.md E1): one full-timing iteration measured end-to-end,
     memory preparation included. Phase 0: wall-clock only; Phase 2 adds the
     per-stage breakdown and NCU capture to the designs volume."""
     import multiprocessing
-    import sys
 
     sys.path.insert(0, BT)
     from harness.evaluation import FullTimingRow, Platform
@@ -275,11 +281,11 @@ def _write_design_tcl(design: dict) -> str:
     return path
 
 
-@app.cls(image=image, gpu="B200",
+@app.cls(image=image, gpu=GPU_KIND,
          volumes={DESIGNS: designs_vol, CACHE: cache_vol},
          scaledown_window=600)
 class TimerSession(SessionRpcMixin):
-    """[B200] Long-lived incremental server (DESIGN.md s4.1, s7).
+    """[GPU] Long-lived incremental server (DESIGN.md s4.1, s7).
 
     Phase 0: loads the design into a persistent OpenSTA process on enter;
     the sta-claude RPC surface (session_rpc.SessionRpcMixin) serves queries
@@ -346,7 +352,7 @@ class TimerSession(SessionRpcMixin):
     @modal.method()
     def report_wns(self) -> float:
         """Back-compat convenience: worst setup slack in ns."""
-        return self.summary()["worst_slack_max"]
+        return SessionRpcMixin.summary(self)["worst_slack_max"]
 
 
 # ---------------------------------------------------------------------------
@@ -367,8 +373,8 @@ GCS_DESIGNS = ("mul", "log2", "div", "hyp")
 def seed_gcs() -> str:
     """[CPU] Fetch GCS-Timer + ASAP7 CCS libs into the designs volume and
     compile both binary variants (GBA and EVALUATE=1 stage-accuracy mode).
-    nvcc compiles fine without a GPU; sm_100 targets the B200, with a
-    compute_90 PTX fallback for older cards."""
+    nvcc compiles fine without a GPU; the fatbin carries sm_90 (H100)
+    and sm_100 (B200) SASS plus compute_90 PTX for anything newer."""
     import shutil
     import zipfile
 
@@ -376,10 +382,19 @@ def seed_gcs() -> str:
 
     gcs = Path(GCS)
     if not (gcs / "src").exists():
+        # clone to /tmp and move: the volume dir may already hold a partial
+        # lib/ from an earlier attempt, which git clone would refuse
+        tmp = Path("/tmp/gcs-clone")
+        if tmp.exists():
+            shutil.rmtree(tmp)
         subprocess.run(
             ["git", "clone", "--depth", "1",
-             "https://github.com/cuhk-eda/GCS-Timer.git", str(gcs)],
+             "https://github.com/cuhk-eda/GCS-Timer.git", str(tmp)],
             check=True)
+        gcs.mkdir(parents=True, exist_ok=True)
+        for item in tmp.iterdir():
+            if not (gcs / item.name).exists():
+                shutil.move(str(item), str(gcs / item.name))
     asap = Path("/tmp/asap7")
     if not asap.exists():
         subprocess.run(
@@ -402,8 +417,9 @@ def seed_gcs() -> str:
             zipfile.ZipFile(f"{spef}.zip").extractall(spef.parent)
 
     nvcc_flags = ["-std=c++14", "-O3", "-x", "cu",
-                  "-gencode", "arch=compute_100,code=sm_100",
-                  "-gencode", "arch=compute_90,code=compute_90"]
+                  "-gencode", "arch=compute_90,code=sm_90",    # H100
+                  "-gencode", "arch=compute_100,code=sm_100",  # B200
+                  "-gencode", "arch=compute_90,code=compute_90"]  # PTX fallback
     subprocess.run(["nvcc", *nvcc_flags, str(gcs / "src/main.cpp"),
                     "-o", str(gcs / "GCS_Timer")], check=True, cwd=gcs)
     eval_src = Path("/tmp/gcs_eval_src")
@@ -420,19 +436,26 @@ def seed_gcs() -> str:
     return "gcs seeded: binaries + 4 CCS libs + 4 benchmarks"
 
 
-@app.function(image=image, gpu="B200", volumes={DESIGNS: designs_vol},
+@app.function(image=image, gpu=GPU_KIND, volumes={DESIGNS: designs_vol},
               timeout=3600)
 def gcs_timer(design: str, cpu: bool = False, evaluate: bool = False) -> dict:
-    """[B200] One GCS-Timer run. evaluate=True reproduces the paper's
+    """[GPU] One GCS-Timer run. evaluate=True reproduces the paper's
     stage-delay accuracy comparison against the shipped PrimeTime/HSPICE
     references; otherwise GBA arrivals (self-compared against test.pt)."""
     if design not in GCS_DESIGNS:
         raise ValueError(f"design must be one of {GCS_DESIGNS}")
-    binary = "./GCS_Timer_evaluate" if evaluate else "./GCS_Timer"
-    args = [binary, design] + (["-CPU"] if cpu else [])
+    binary = "GCS_Timer_evaluate" if evaluate else "GCS_Timer"
+    if not Path(GCS, binary).exists():
+        raise RuntimeError(
+            f"{GCS}/{binary} not found -- run `modal run "
+            "blacktimer/modal_app.py::seed_gcs` first")
+    args = [f"./{binary}", design] + (["-CPU"] if cpu else [])
     t0 = time.monotonic()
-    proc = subprocess.run(args, cwd=GCS, capture_output=True, text=True,
-                          check=True)
+    proc = subprocess.run(args, cwd=GCS, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"GCS-Timer failed (rc={proc.returncode}):\n"
+            f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}")
     return {
         "design": design,
         "mode": ("CPU" if cpu else "GPU") + ("/EVALUATE" if evaluate else ""),
@@ -475,10 +498,7 @@ def seed_designs() -> None:
                 continue
             for f in files:
                 batch.put_file(str(examples / f), f"/{name}/{f}")
-            desc = {k: v for k, v in meta.items()}
-            batch.put_file(
-                _tmp_json(desc), f"/{name}/design.json"
-            )
+            batch.put_file(_tmp_json(meta), f"/{name}/design.json")
             print(f"seeded {name}")
 
 

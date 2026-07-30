@@ -98,7 +98,7 @@ def main():
     for kind in ("hold", "setup"):
         ds = deltas[kind]
         xs, ys = pairs[kind]
-        wns = min((abs(v) for v in ys), default=0) if not ys else abs(min(ys))
+        wns = abs(min(ys)) if ys else 0
         out[kind] = {
             "n": len(ds),
             "max_abs_delta_ns": max(ds) if ds else None,

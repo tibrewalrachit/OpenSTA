@@ -111,6 +111,19 @@ class TestQueries:
         assert clk["is_generated"] is False
         assert set(clk["sources"]) == {"clk1", "clk2", "clk3"}
 
+    def test_clock_info_virtual_clock(self, rpc):
+        # A source-less clock must not desync the token stream (regression:
+        # empty sources collapsed in the flat Tcl list).
+        rpc.run_tcl("create_clock -name bt_virt -period 8")
+        try:
+            clocks = {c["name"]: c for c in rpc.clock_info()["clocks"]}
+            assert clocks["bt_virt"]["sources"] == []
+            assert clocks["bt_virt"]["period"] == pytest.approx(8.0)
+            assert set(clocks["clk"]["sources"]) == {"clk1", "clk2", "clk3"}
+        finally:
+            # this OpenSTA names it delete_clock, not SDC's remove_clock
+            rpc.run_tcl("delete_clock bt_virt")
+
 
 class TestTclAndEco:
     def test_run_tcl(self, rpc):

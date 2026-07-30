@@ -36,6 +36,7 @@ setup slack AND a real hold violation of -0.0027 ns at r1/D).
 | `report_checks -format full_clock_expanded -fields {slew cap input_pins fanout}` | OK | fixtures captured in `work/fixtures/` (setup, hold, min_max) |
 | `sta::find_timing -full_update` | OK | full timing update; note the name — there is **no** `update_timing` command in this version |
 | `sta::redirect_string_begin` / `sta::redirect_string_end` | OK | captures report output into a string; REQUIRED when driving `sta` over a pipe, because the C++ report stream is block-buffered and arrives out of order with Tcl `puts` otherwise |
+| `remove_clock` | **MISSING** | this OpenSTA names it `delete_clock` (`delete_clock [-all] clocks`) |
 | `write_sdc -no_timestamp` | OK | exception recovery path |
 
 ## Interactive-pipe gotchas (for any backend driving `sta -no_splash`)

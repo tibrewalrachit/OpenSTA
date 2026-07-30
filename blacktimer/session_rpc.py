@@ -280,18 +280,22 @@ class SessionRpcMixin:
         return {"count": len(exceptions), "exceptions": exceptions}
 
     def clock_info(self):
-        """All clocks: period, sources, generated-ness."""
+        """All clocks: period, sources, generated-ness. A source-less
+        (virtual) clock emits "-" so the flat token stream stays aligned."""
         raw = self._shell.eval(
             "set __bt_o {}; foreach __bt_c [all_clocks] {"
+            " set __bt_srcs [join [lmap __bt_src"
+            " [get_property $__bt_c sources]"
+            " { get_full_name $__bt_src }] ,];"
+            " if {$__bt_srcs eq {}} { set __bt_srcs - };"
             " lappend __bt_o [get_property $__bt_c name]"
             " [get_property $__bt_c period]"
             " [get_property $__bt_c is_generated]"
-            " [join [lmap __bt_src [get_property $__bt_c sources]"
-            " { get_full_name $__bt_src }] ,] }; set __bt_o"
+            " $__bt_srcs }; set __bt_o"
         )
         tokens = raw.split()
         clocks = []
-        for name, period, is_gen, *rest in zip(
+        for name, period, is_gen, srcs in zip(
                 tokens[0::4], tokens[1::4], tokens[2::4], tokens[3::4]):
             period_ns = _maybe_float(period)
             clocks.append({
@@ -299,7 +303,7 @@ class SessionRpcMixin:
                 "period": period_ns,
                 "period_ps": _ps(period_ns),
                 "is_generated": is_gen == "1",
-                "sources": rest[0].split(",") if rest and rest[0] else [],
+                "sources": [] if srcs == "-" else srcs.split(","),
             })
         return {"clocks": clocks}
 

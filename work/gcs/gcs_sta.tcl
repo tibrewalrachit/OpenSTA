@@ -14,6 +14,7 @@ set_input_transition 20 [all_inputs]
 set t1 [clock milliseconds]
 set us [lindex [time { sta::find_timing -full_update }] 0]
 puts "PHASES parse_ms=[expr {$t1-$t0}] update_ms=[format %.1f [expr {$us/1000.0}]]"
+file mkdir $S/results
 set fh [open $S/results/$D.sta_nldm.csv w]
 puts $fh "port,arrival_rise,arrival_fall"
 foreach port [get_ports -filter {direction == output} *] {
