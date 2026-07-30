@@ -1,0 +1,28 @@
+{
+  "design": "aes_core",
+  "endpoints_opensta": 1924,
+  "matched": 1924,
+  "missing_in_opentimer": 0,
+  "hold": {
+    "n": 1393,
+    "max_abs_delta_ns": 67.788539,
+    "mean_abs_delta_ns": 17.344461885139957,
+    "pearson_r": 0.9987544014741718,
+    "within_gate": 30,
+    "within_1pct_wns": 624,
+    "wns_opensta": -1422.148926,
+    "wns_opentimer": -1466.387
+  },
+  "setup": {
+    "n": 1393,
+    "max_abs_delta_ns": 66.371482,
+    "mean_abs_delta_ns": 16.1097198384781,
+    "pearson_r": 0.9995174993178344,
+    "within_gate": 44,
+    "within_1pct_wns": 756,
+    "wns_opensta": -1587.178955,
+    "wns_opentimer": -1604.246
+  },
+  "gate": "|d|<=0.002ns or 0.1% rel",
+  "mismatch_count": 2712
+}

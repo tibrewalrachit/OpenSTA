@@ -1,0 +1,28 @@
+{
+  "design": "des_perf",
+  "endpoints_opensta": 17833,
+  "matched": 17833,
+  "missing_in_opentimer": 0,
+  "hold": {
+    "n": 9946,
+    "max_abs_delta_ns": 74.9858079999999,
+    "mean_abs_delta_ns": 17.48242566257794,
+    "pearson_r": 0.9996331205067728,
+    "within_gate": 59,
+    "within_1pct_wns": 5600,
+    "wns_opensta": -1667.437012,
+    "wns_opentimer": -1728.164
+  },
+  "setup": {
+    "n": 9946,
+    "max_abs_delta_ns": 2197.0767620000006,
+    "mean_abs_delta_ns": 401.91824595173955,
+    "pearson_r": 0.9972890648308929,
+    "within_gate": 70,
+    "within_1pct_wns": 7787,
+    "wns_opensta": -5097.456543,
+    "wns_opentimer": -7219.993
+  },
+  "gate": "|d|<=0.002ns or 0.1% rel",
+  "mismatch_count": 19763
+}

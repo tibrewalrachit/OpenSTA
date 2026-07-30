@@ -1,0 +1,28 @@
+{
+  "design": "ac97_ctrl",
+  "endpoints_opensta": 7151,
+  "matched": 7151,
+  "missing_in_opentimer": 0,
+  "hold": {
+    "n": 4732,
+    "max_abs_delta_ns": 93.02441099999999,
+    "mean_abs_delta_ns": 13.578867989644955,
+    "pearson_r": 0.9995539998248683,
+    "within_gate": 75,
+    "within_1pct_wns": 3235,
+    "wns_opensta": -1661.252563,
+    "wns_opentimer": -1716.15
+  },
+  "setup": {
+    "n": 4732,
+    "max_abs_delta_ns": 95.72383200000002,
+    "mean_abs_delta_ns": 14.661458157016073,
+    "pearson_r": 0.9995238934058577,
+    "within_gate": 38,
+    "within_1pct_wns": 3304,
+    "wns_opensta": -1997.923828,
+    "wns_opentimer": -2028.347
+  },
+  "gate": "|d|<=0.002ns or 0.1% rel",
+  "mismatch_count": 9351
+}

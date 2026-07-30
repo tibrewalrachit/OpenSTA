@@ -1,0 +1,28 @@
+{
+  "design": "vga_lcd",
+  "endpoints_opensta": 42609,
+  "matched": 42609,
+  "missing_in_opentimer": 0,
+  "hold": {
+    "n": 25199,
+    "max_abs_delta_ns": 470.23449999999997,
+    "mean_abs_delta_ns": 23.473263875868128,
+    "pearson_r": 0.9984861981417477,
+    "within_gate": 410,
+    "within_1pct_wns": 12877,
+    "wns_opensta": -1937.257935,
+    "wns_opentimer": -2009.969
+  },
+  "setup": {
+    "n": 25199,
+    "max_abs_delta_ns": 1410.8097710000002,
+    "mean_abs_delta_ns": 237.8569237060988,
+    "pearson_r": 0.9815246182765637,
+    "within_gate": 88,
+    "within_1pct_wns": 12038,
+    "wns_opensta": -3716.834229,
+    "wns_opentimer": -5127.644
+  },
+  "gate": "|d|<=0.002ns or 0.1% rel",
+  "mismatch_count": 49900
+}
