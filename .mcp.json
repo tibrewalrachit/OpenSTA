@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "sta": {
+      "command": "python3",
+      "args": [
+        "${CLAUDE_PROJECT_DIR}/sta-claude/server/sta_mcp.py",
+        "--backend",
+        "opensta"
+      ],
+      "env": {
+        "STA_BINARY": "${CLAUDE_PROJECT_DIR}/build/sta",
+        "STA_DESIGN": "${CLAUDE_PROJECT_DIR}/work/design.tcl"
+      }
+    }
+  }
+}
