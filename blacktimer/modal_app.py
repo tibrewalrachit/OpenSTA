@@ -45,7 +45,8 @@ app = modal.App("blacktimer")
 # ---------------------------------------------------------------------------
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11"
+        # 12.8+: first CUDA with Blackwell (sm_100) codegen for the B200s
+        "nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.11"
     )
     .apt_install(
         "git", "wget", "cmake", "ninja-build", "gcc", "g++", "gdb",
@@ -60,7 +61,7 @@ image = (
         "tar -xf cudd-3.0.0.tar.gz && rm cudd-3.0.0.tar.gz",
         "cd cudd-3.0.0 && ./configure && make -j$(nproc)",
     )
-    .pip_install("pytest")
+    .pip_install("pytest", "py7zr")
     # Vendored OpenSTA source == this repository (DESIGN.md section 2.3:
     # reuse OpenSTA's readers rather than rewriting parsers). Deliberately
     # NOT compiled here: a compile layer makes the image build a ~30-minute
@@ -349,6 +350,98 @@ class TimerSession(SessionRpcMixin):
 
 
 # ---------------------------------------------------------------------------
+# GCS-Timer (cuhk-eda, DAC'24, BSD-3): GPU-accelerated CCS-model timing.
+# Runs as its own function family -- its frontend is fixed to the four EPFL
+# benchmarks it ships (mul/log2/div/hyp) plus the ASAP7 RVT_TT CCS libraries,
+# so it does not plug into the design.json flow. PrimeTime and HSPICE
+# reference results ship with the benchmarks, so its accuracy claims are
+# reproducible here without any commercial tool.
+# ---------------------------------------------------------------------------
+
+GCS = f"{DESIGNS}/gcs"
+GCS_DESIGNS = ("mul", "log2", "div", "hyp")
+
+
+@app.function(image=image, volumes={DESIGNS: designs_vol}, cpu=8,
+              timeout=7200)
+def seed_gcs() -> str:
+    """[CPU] Fetch GCS-Timer + ASAP7 CCS libs into the designs volume and
+    compile both binary variants (GBA and EVALUATE=1 stage-accuracy mode).
+    nvcc compiles fine without a GPU; sm_100 targets the B200, with a
+    compute_90 PTX fallback for older cards."""
+    import shutil
+    import zipfile
+
+    import py7zr
+
+    gcs = Path(GCS)
+    if not (gcs / "src").exists():
+        subprocess.run(
+            ["git", "clone", "--depth", "1",
+             "https://github.com/cuhk-eda/GCS-Timer.git", str(gcs)],
+            check=True)
+    asap = Path("/tmp/asap7")
+    if not asap.exists():
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--filter=blob:none",
+             "--sparse",
+             "https://github.com/The-OpenROAD-Project/asap7sc7p5t_28.git",
+             str(asap)], check=True)
+        subprocess.run(["git", "-C", str(asap), "sparse-checkout", "set",
+                        "LIB/CCS"], check=True)
+    (gcs / "lib").mkdir(exist_ok=True)
+    for lib in ("INVBUF_RVT_TT_ccs_220122", "SIMPLE_RVT_TT_ccs_211120",
+                "AO_RVT_TT_ccs_211120", "OA_RVT_TT_ccs_211120"):
+        name = f"asap7sc7p5t_{lib}.lib"
+        if not (gcs / "lib" / name).exists():
+            with py7zr.SevenZipFile(asap / "LIB/CCS" / f"{name}.7z") as z:
+                z.extractall(gcs / "lib")
+    for d in ("div", "hyp"):
+        spef = gcs / "bm" / d / "test.spef"
+        if not spef.exists():
+            zipfile.ZipFile(f"{spef}.zip").extractall(spef.parent)
+
+    nvcc_flags = ["-std=c++14", "-O3", "-x", "cu",
+                  "-gencode", "arch=compute_100,code=sm_100",
+                  "-gencode", "arch=compute_90,code=compute_90"]
+    subprocess.run(["nvcc", *nvcc_flags, str(gcs / "src/main.cpp"),
+                    "-o", str(gcs / "GCS_Timer")], check=True, cwd=gcs)
+    eval_src = Path("/tmp/gcs_eval_src")
+    if eval_src.exists():
+        shutil.rmtree(eval_src)
+    shutil.copytree(gcs / "src", eval_src)
+    hpp = eval_src / "gpu_timer.hpp"
+    hpp.write_text(hpp.read_text().replace(
+        "#define EVALUATE 0", "#define EVALUATE 1", 1))
+    subprocess.run(["nvcc", *nvcc_flags, str(eval_src / "main.cpp"),
+                    "-o", str(gcs / "GCS_Timer_evaluate")], check=True,
+                   cwd=gcs)
+    designs_vol.commit()
+    return "gcs seeded: binaries + 4 CCS libs + 4 benchmarks"
+
+
+@app.function(image=image, gpu="B200", volumes={DESIGNS: designs_vol},
+              timeout=3600)
+def gcs_timer(design: str, cpu: bool = False, evaluate: bool = False) -> dict:
+    """[B200] One GCS-Timer run. evaluate=True reproduces the paper's
+    stage-delay accuracy comparison against the shipped PrimeTime/HSPICE
+    references; otherwise GBA arrivals (self-compared against test.pt)."""
+    if design not in GCS_DESIGNS:
+        raise ValueError(f"design must be one of {GCS_DESIGNS}")
+    binary = "./GCS_Timer_evaluate" if evaluate else "./GCS_Timer"
+    args = [binary, design] + (["-CPU"] if cpu else [])
+    t0 = time.monotonic()
+    proc = subprocess.run(args, cwd=GCS, capture_output=True, text=True,
+                          check=True)
+    return {
+        "design": design,
+        "mode": ("CPU" if cpu else "GPU") + ("/EVALUATE" if evaluate else ""),
+        "wall_seconds": time.monotonic() - t0,
+        "log": proc.stdout[-8000:],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Local entrypoints
 # ---------------------------------------------------------------------------
 
@@ -412,3 +505,12 @@ def ci() -> None:
 @app.local_entrypoint()
 def diff(design: str) -> None:
     print(golden_diff.remote(design))
+
+
+@app.local_entrypoint()
+def gcs(design: str = "mul", cpu: bool = False, evaluate: bool = False) -> None:
+    """Run GCS-Timer on a benchmark (seed once with ::seed_gcs)."""
+    result = gcs_timer.remote(design, cpu, evaluate)
+    print(f"{result['design']} [{result['mode']}] "
+          f"wall={result['wall_seconds']:.2f}s")
+    print(result["log"])
